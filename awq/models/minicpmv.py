@@ -3,7 +3,7 @@ from typing import List, Tuple
 from .base import BaseAWQForCausalLM
 from awq.utils.fused_utils import fuse_qkv
 from awq.modules.fused.block import LlamaLikeBlock
-from awq.modules.fused.model import LlamaLikeModel
+#from awq.modules.fused.model import LlamaLikeModel
 from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer as OldLlamaDecoderLayer,
 )
@@ -11,19 +11,9 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2DecoderLayer as OldQwen2DecoderLayer,
     Qwen2ForCausalLM as OldQwen2ForCausalLM,
 )
-from .base import (
-    Annotated,
-    AwqConfig,
-    BaseAWQForCausalLM,
-    Dict,
-    Doc,
-    List,
-    PreTrainedTokenizer,
-    Union,
-)
-
 from transformers.models.llava.modeling_llava import (
     LlavaForConditionalGeneration as OldLlavaForConditionalGeneration,
+    
 )
 from awq.modules.fused.norm import FasterTransformerRMSNorm
 import torch
@@ -33,75 +23,86 @@ from copy import deepcopy
 from PIL import Image
 from awq.modules.fused.attn import QuantAttentionFused
 from torch import nn
-from ..quantize.quantizer import AwqQuantizer, clear_memory, get_best_device
+from awq.utils import fused_utils
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast
+)
+from awq.modules.fused.block import (
+    LlamaLikeBlock,
+)
 
-class CPMVAwqQuantizer(AwqQuantizer):
-    def init_quant(self, n_samples=None, max_seq_len=None):
-        modules = self.awq_model.get_model_layers(self.model)
-        samples = self.calib_data
 
-        inps = []
-        layer_kwargs = {}
+class LlamaLikeModel(nn.Module):
+    """
+    LlamaLikeModel is intended to be reused across models that have
+    an architecture that closely resembles Llama, e.g. Mistral and Aquila.
+    """
 
-        best_device = get_best_device()
-        modules[0] = modules[0].to(best_device)
-        self.awq_model.move_embed(self.model, best_device)
+    def __init__(self, vocab_size, blocks, embedding, norm):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embedding = embedding
+        self.blocks: List[LlamaLikeBlock] = nn.ModuleList(blocks)
+        self.norm = norm
+        self.last_forward_num_tokens = 0
+        
+    @property
+    def embed_tokens(self):
+        return self.embedding
+    
+    @property
+    def layers(self):
+        return self.blocks
 
-        # get input and kwargs to layer 0
-        # with_kwargs is only supported in PyTorch 2.0
-        # use this Catcher hack for now
-        class Catcher(nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds=None,
+        attn_bias=None,
+        attention_mask=None,
+        is_causal=None,
+        *args,
+        **kwargs,
+    ):
+        if input_ids!=None:
+            input_ids, self.last_forward_num_tokens = fused_utils.prepare_input_ids(
+                input_ids, self.last_forward_num_tokens
+            )
+            _bsz, seqlen = input_ids.shape
+            h = self.embedding(input_ids)
+        else:
+            _bsz, seqlen = inputs_embeds.shape[:2]
+            h = inputs_embeds
 
-            def forward(self, *args, **kwargs):
-                # assume first input to forward is hidden states
-                if len(args) > 0:
-                    hidden_states = args[0]
-                    del args
-                else:
-                    first_key = list(kwargs.keys())[0]
-                    hidden_states = kwargs.pop(first_key)
+        fused_utils.prepare_cache(self.blocks, seqlen)
 
-                inps.append(hidden_states)
-                layer_kwargs.update(kwargs)
-                raise ValueError  # early exit to break later inference
+        
 
-        def move_to_device(obj: torch.Tensor | nn.Module, device: torch.device):
-            def get_device(obj: torch.Tensor | nn.Module):
-                if isinstance(obj, torch.Tensor):
-                    return obj.device
-                return next(obj.parameters()).device
+        mask = fused_utils.prepare_attention_mask(
+            seqlen=seqlen,
+            start_pos=self.blocks[0].attn.start_pos,
+            device=input_ids.device if input_ids is not None else inputs_embeds.device,
+            type_as=h,
+        )
 
-            if get_device(obj) != device:
-                obj = obj.to(device)
-            return obj
+        for layer in self.blocks:
+            h, mask = fused_utils.prepare_correct_devices(
+                layer,
+                h,
+                mask,
+            )
+            h, _, _ = layer(
+                h, None, attention_mask=mask, is_causal=is_causal
+            )
+        h = self.norm(h)
 
-        # patch layer 0 to catch input and kwargs
-        modules[0] = Catcher(modules[0])
-        for k, v in samples.items():
-            if isinstance(v, (torch.Tensor, nn.Module)):
-                samples[k] = move_to_device(v, best_device)
-        try:
-            self.model(**samples)
-        except ValueError:  # work with early exit
-            pass
-        finally:
-            for k, v in samples.items():
-                if isinstance(v, (torch.Tensor, nn.Module)):
-                    samples[k] = move_to_device(v, "cpu")
-        modules[0] = modules[0].module  # restore
-
-        del samples
-        inps = inps[0]
-
-        modules[0] = modules[0].cpu()
-        self.awq_model.move_embed(self.model, "cpu")
-
-        clear_memory()
-
-        return modules, layer_kwargs, inps
+        return BaseModelOutputWithPast(
+            last_hidden_state=h,
+            past_key_values=None,
+            hidden_states=(),
+            attentions=(),
+        )
 
 class MiniCPMVAWQForCausalLM(BaseAWQForCausalLM):
     layer_type = "Qwen2DecoderLayer"
@@ -248,97 +249,6 @@ class MiniCPMVAWQForCausalLM(BaseAWQForCausalLM):
     #     fuser = MiniCPMVFuser(model) # 这里是算子融合
     #     fuser.fuse_transformer()
 
-    # hack to use `Qwen2VLAwqQuantizer` as quantizer
-    @torch.no_grad()
-    def quantize(
-        self,
-        tokenizer: Annotated[
-            PreTrainedTokenizer, Doc("The tokenizer to use for quantization.")
-        ] = None,
-        quant_config: Annotated[
-            Dict, Doc("The quantization config you want to use.")
-        ] = {},
-        calib_data: Annotated[
-            Union[str, List[str]],
-            Doc(
-                "The calibration dataset. Either a string pointing to Huggingface or a list of preloaded examples."
-            ),
-        ] = "pileval",
-        split: Annotated[str, Doc("The split of calib_data.")] = "train",
-        text_column: Annotated[str, Doc("The text column of calib_data.")] = "text",
-        duo_scaling: Annotated[
-            bool, Doc("Whether to scale using both w/x or just x.")
-        ] = True,
-        export_compatible: Annotated[
-            bool,
-            Doc(
-                "This argument avoids real quantization by only applying the scales without quantizing down to FP16."
-            ),
-        ] = False,
-        apply_clip: Annotated[
-            bool,
-            Doc(
-                "Whether to apply clipping to the model during quantization. Some models may perform better with this set to False."
-            ),
-        ] = True,
-        n_parallel_calib_samples: Annotated[
-            int,
-            Doc(
-                "The number of parallel samples to run through the model. "
-                "A high number of parallel samples can result in OOM during quantization if max_calib_samples is high enough. "
-                "If None, runs through all samples at the same time. "
-                "You can set this to a low number for more memory efficient quantization."
-            ),
-        ] = None,
-        max_calib_samples: Annotated[
-            int, Doc("The maximum number of samples to run through the model.")
-        ] = 128,
-        max_calib_seq_len: Annotated[
-            int,
-            Doc(
-                "The maximum sequence length of the calibration dataset. Discard samples greater than max_calib_seq_len."
-            ),
-        ] = 512,
-        max_chunk_memory: Annotated[
-            int,
-            Doc(
-                "The loss computation and per-channel mean is optimized into chunked computations."
-                " Adjust this parameter to increase or decrease memory usage for these computations."
-                " Default is 1GB (1024 * 1024 * 1024)."
-            ),
-        ] = 1024
-        * 1024
-        * 1024,
-    ):
-        self.quant_config: AwqConfig = AwqConfig.from_dict(quant_config)
-
-        if hasattr(self, "modules_to_not_convert"):
-            self.quant_config.modules_to_not_convert = self.modules_to_not_convert
-
-        self.quantizer = CPMVAwqQuantizer(
-            self,
-            self.model,
-            tokenizer,
-            self.quant_config.w_bit,
-            self.quant_config.q_group_size,
-            self.quant_config.zero_point,
-            self.quant_config.version,
-            calib_data,
-            split,
-            text_column,
-            duo_scaling,
-            modules_to_not_convert=self.quant_config.modules_to_not_convert,
-            export_compatible=export_compatible,
-            apply_clip=apply_clip,
-            n_parallel_calib_samples=n_parallel_calib_samples,
-            max_calib_samples=max_calib_samples,
-            max_calib_seq_len=max_calib_seq_len,
-            max_chunk_memory=max_chunk_memory,
-        )
-        self.quantizer.quantize()
-
-        self.is_quantized = True
-
     @staticmethod
     def get_model_layers(model: OldQwen2ForCausalLM):
         return model.llm.model.layers
@@ -404,3 +314,55 @@ class MiniCPMVAWQForCausalLM(BaseAWQForCausalLM):
 
         return layers
 
+
+class MiniCPMVFuser:
+    def __init__(self, model: OldQwen2ForCausalLM):
+        self.model = model
+
+        self.qwen2_blocks: List[Tuple[str, OldQwen2DecoderLayer]] = [
+            (name, module)
+            for name, module in self.model.named_modules()
+            if "Qwen2DecoderLayer".lower() in module.__class__.__name__.lower()
+        ]
+
+    def fuse_transformer(self):
+        blocks = []
+
+        module: OldQwen2DecoderLayer
+        for module in tqdm.tqdm(self.model.llm.model.layers, desc="Fusing layers..."):
+            device = next(iter(module.state_dict().values())).device
+            qkv = fuse_qkv(
+                module,
+                module.self_attn.q_proj,
+                module.self_attn.k_proj,
+                module.self_attn.v_proj,
+            )
+            norm_1 = FasterTransformerRMSNorm(
+                module.input_layernorm.weight, module.input_layernorm.variance_epsilon
+            )
+            norm_2 = FasterTransformerRMSNorm(
+                module.post_attention_layernorm.weight,
+                module.post_attention_layernorm.variance_epsilon,
+            )
+            blocks.append(
+                LlamaLikeBlock(
+                    hidden_size=self.model.config.hidden_size,
+                    n_heads=self.model.config.num_attention_heads,
+                    n_kv_heads=self.model.config.num_key_value_heads,
+                    qkv_layer=qkv,
+                    o_proj=module.self_attn.o_proj,
+                    mlp=module.mlp,
+                    norm_1=norm_1,
+                    norm_2=norm_2,
+                    dev=device,
+                    max_seq_len=self.model.config.max_seq_len,
+                )
+            )
+
+        self.model.llm.model = LlamaLikeModel(
+            self.model.config.vocab_size,
+            blocks,
+            self.model.llm.model.embed_tokens,
+            self.model.llm.model.norm,
+        )
+        setattr(self.model.llm.model, "blocks", self.model.llm.model.blocks)
