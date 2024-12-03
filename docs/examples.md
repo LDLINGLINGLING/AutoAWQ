@@ -761,3 +761,102 @@ generation_output = model.generate(
     streamer=streamer
 )
 ```
+
+### MiniCPMV2.6
+```python
+from __future__ import annotations
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+import argparse
+from awq.utils.minicpmv2_6_utils import *
+
+def main():
+# 打印读取的 JSON 列表
+
+    # 定义 argparse 解析器
+    parser = argparse.ArgumentParser(description="Quantize and save a model.")
+    
+    # 添加参数
+    parser.add_argument('--model-path', type=str, default="/root/ld/ld_model_pretrained/Minicpmv2_6",help='Path to the model directory.')
+    parser.add_argument('--quant-path', type=str, default="/root/ld/ld_model_pretrained/Minicpmv2_6_awq_new",help='Path to save the quantized model.')
+    parser.add_argument('--zero-point', action='store_true',help='Enable zero point quantization.')
+    parser.add_argument('--q-group-size', type=int, default=128,help='Quantization group size.')
+    parser.add_argument('--w-bit', type=int, default=4,help='Weight bit size.')
+    parser.add_argument('--version', type=str, default="GEMM",help='Quantization version.')
+    parser.add_argument('--batch-size', type=int, default=8,help='you will forward batch_size, 4090 machine can run 8 batch, A100 machine can run 32 batch.')
+    args = parser.parse_args()
+    quant_config = {"zero_point": args.zero_point, "q_group_size": args.q_group_size, "w_bit": args.w_bit, "version": args.version}
+    batch=args.batch_size # you will forward batch_size, 4090 machine can run 8 batch, A100 machine can run 32 batch
+    # here, we use a caption dataset **only for demonstration**. You should replace it with your own sft dataset.
+    
+    #loading the data set
+    
+    # Then you need to prepare your data for calibaration. What you need to do is just put samples into a list,
+    dataset = [
+    {
+        "id": "0",
+        "conversations": [
+            {"content": "<image>\nCould you help me identify what is shown in this picture?", "role": "user"},
+            {"content": "2017 Wenshan Municipal Party Committee Governance Record\nPolicies are tilted towards eligible professional farmers.....", "role": "assistant"}
+        ],
+        "image": "/root/ld/ld_dataset/30k_data/63677831/198.jpg"
+    },
+    {
+        "id": "1",
+        "conversations": [
+            {"content": "<image>\nI need help determining what is presented in this picture.", "role": "user"},
+            {"content": "University computer science is the most important course for the nation; we need to start with the children....", "role": "assistant"}
+        ],
+        "image": "/root/ld/ld_dataset/30k_data/61520120/3.jpg"
+    }
+]
+    #dataset=prepare_dataset(n_sample=32)
+    # Load your tokenizer and model with AutoAWQ
+    model = AutoAWQForCausalLM.from_pretrained(args.model_path).cuda()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True,device_map={"": "cuda:0"})
+
+    # set some parameters
+    if hasattr(model.config, "slice_config"):
+            model.config.slice_config.max_slice_nums = 1
+            slice_config = model.config.slice_config.to_dict()
+    else:
+        model.config.max_slice_nums = 1
+        slice_config = model.config.to_dict()
+
+    if hasattr(model.config, "batch_vision_input"):
+        batch_vision = model.config.batch_vision_input
+    else:
+        batch_vision = False
+    transform_func = build_transform()
+    calib_data = SupervisedDataset(
+            dataset,
+            transform_func,
+            tokenizer,
+            slice_config=slice_config,
+            llm_type="qwen2",
+            patch_size=model.config.patch_size,
+            query_nums=model.config.query_num,
+            batch_vision=batch_vision,
+            max_length=2048,
+        )
+    out_data=[]
+    batch_data=[]
+    for index in range(len(calib_data)//batch):
+        batch_data=[]
+        for j in range(batch):
+            batch_data.append(calib_data[j+index*batch])
+        out_data.append(data_collator(batch_data))
+
+    # Then just run the calibration process by one line of code:
+    model.quantize(calib_data=out_data[0], quant_config=quant_config)
+
+    # remove pos_embed
+    if hasattr(model.model, 'resampler') and hasattr(model.model.resampler, 'pos_embed'):
+        del model.model.resampler.pos_embed
+    # Finally, save the quantized model:
+    model.model.config.use_cache = model.model.generation_config.use_cache = True
+    model.save_quantized(args.quant_path, safetensors=True, shard_size="4GB")
+
+if __name__ == "__main__":
+    main()
+```

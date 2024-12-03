@@ -27,4 +27,5 @@ from .deepseek_v2 import DeepseekV2AWQForCausalLM
 from .minicpm import MiniCPMAWQForCausalLM
 from .internlm2 import InternLM2AWQForCausalLM
 from .minicpm3 import MiniCPM3AWQForCausalLM
+from .minicpmv import MiniCPMVAWQForCausalLM
 from .qwen2vl import Qwen2VLAWQForCausalLM
