@@ -1,7 +1,7 @@
 from awq import AutoAWQForCausalLM
 from transformers import AutoTokenizer
 
-model_path = 'mistralai/Mistral-7B-Instruct-v0.2'
+model_path = '/home/featurize/work/MiniCPM-4v-3b'
 quant_path = 'mistral-instruct-v0.2-awq'
 quant_config = { "zero_point": True, "q_group_size": 128, "w_bit": 4, "version": "GEMM" }
 

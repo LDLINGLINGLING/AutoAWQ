@@ -244,10 +244,14 @@ class AwqQuantizer:
     ) -> torch.Tensor:
         if self.n_parallel_calib_samples is None:
             # runs through all samples at once
+            
+            if 'Attention' in str(type(module)):
+                module_kwargs.pop('past_key_value', None)
+                if 'attention_mask' not in module_kwargs:
+                    module_kwargs['attention_mask'] = None
             module_output = module(x, **module_kwargs)
             if isinstance(module_output, tuple):
                 module_output = module_output[0]
-        else:
             # memory efficiently runs through all calibration samples
             # but only n_parallel_calib_samples at a time
             module_output = []
