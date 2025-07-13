@@ -23,7 +23,9 @@ from PIL import Image
 class MiniCPMVAWQForCausalLM(BaseAWQForCausalLM):
     layer_type = "LlamaDecoderLayer"
     max_seq_len_key = "max_position_embeddings"
-
+    @property
+    def device(self):
+        return next(self.parameters()).device
     def chat(
         self,
         image,
